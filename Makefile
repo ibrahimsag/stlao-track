@@ -1,2 +1,2 @@
 all:
-	ghc Main.hs -o trace_checker
+	ghc -O2 Main.hs -o trace_checker

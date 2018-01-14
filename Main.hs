@@ -1,16 +1,17 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, BangPatterns #-}
 module Main where 
 
 import qualified System.Environment as Env
+import System.IO (IOMode(..), withFile)
+import Text.Printf (hPrintf)
+import Text.Read (readMaybe)
 
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State
 import Control.Applicative ((<|>))
+import Data.Foldable (traverse_)
 
 import Data.Word (Word8)
-
-import Data.Bits (Bits)
-import qualified Data.Bits as Bits
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -20,7 +21,9 @@ import Data.Array.Unboxed (UArray, (!))
 import qualified Data.Array.IArray as A
 
 import Data.Maybe (catMaybes)
-import Data.List (transpose)
+import Data.List (transpose, tails, foldl')
+
+import Dequeue (Dequeue(..), BankersDequeue)
 
 data Formula
   = Globally Int Formula
@@ -48,18 +51,6 @@ type Parser a =
 run :: Parser a -> C.ByteString -> Maybe a
 run = 
   evalStateT
-
--- decodeInt :: (Bits a, Num a) => ByteString -> a
--- decodeInt = 
---   BS.foldl' (\n h -> Bits.shiftL n 8 Bits..|. fromIntegral h) 0
-
--- bsOfSize :: Int -> Parser ByteString
--- bsOfSize = 
---   state . BS.splitAt
-
--- intOfSize :: (Bits a, Num a) => Int -> Parser a
--- intOfSize = 
---   fmap decodeInt . bsOfSize
 
 parseInt' :: Parser Int
 parseInt' =  StateT C.readInt
@@ -95,7 +86,7 @@ parseMean :: Parser Arithmetic
 parseMean = Mean <$> (parseChar 'M' *> parseInt) <*> parseArithmetic
 
 parseVariance :: Parser Arithmetic
-parseVariance = Variance <$> (parseChar 'N' *> parseInt) <*> parseArithmetic
+parseVariance = Variance <$> (parseChar 'V' *> parseInt) <*> parseArithmetic
 
 parseArithmetic :: Parser Arithmetic
 parseArithmetic
@@ -105,7 +96,6 @@ parseArithmetic
   <|> parseMultiplication
   <|> parseMean
   <|> parseVariance
-
 
 parseGlobally :: Parser Formula
 parseGlobally = Globally <$> (parseChar 'G' *> parseInt) <*> parseFormula
@@ -144,126 +134,173 @@ parseFormula
 
 -- END PARSER
 
-arrayFromList :: A.IArray arr e => [e] -> arr Int e
-arrayFromList l = A.listArray (0, length l - 1) l
+type Signal = [Double]
 
-zipArraysWith :: (Double -> Double -> Double) -> UArray Int Double -> UArray Int Double -> UArray Int Double
-zipArraysWith f arr1 arr2 =
-   A.listArray
-     (min (A.bounds arr1) (A.bounds arr2))
-     (zipWith f (A.elems arr1) (A.elems arr2))
+gfst :: (a, b, c) -> a
+gfst (!a, _, _) = a
 
-type Signal = UArray Int Double
+clearLastElementsFromQueue :: (Double -> Double -> Bool) -> BankersDequeue (Int, Double) -> Double -> BankersDequeue (Int, Double)
+clearLastElementsFromQueue pred queue e =
+  case popBack queue of
+    Nothing -> queue
+    Just ((!lastInd, !lastVal), !rest) ->
+      if pred lastVal e
+      then clearLastElementsFromQueue pred rest e
+      else queue
 
-meanAt :: Int -> Int -> Signal -> Double
-meanAt i r arr = s / (fromIntegral r)
+streamingMin :: Int -> Signal -> Signal
+streamingMin window es = stream es
   where
-    s = sum [ arr ! j | j <- A.range (i, i + r - 1) ]
+    stream = drop window . (map gfst) . (scanl iter (0, 0, empty))
+    iter :: (Double, Int, BankersDequeue (Int, Double)) -> Double -> (Double, Int, BankersDequeue (Int, Double))
+    iter (_, !ind, q) !e =
+      let newQ = pushBack (clearLastElementsFromQueue (>) q e) (ind, e)
+      in case popFront newQ of
+        Nothing                                -> (0, ind + 1, newQ)
+        Just (!(!firstInd, !firstVal), shiftedQ)  ->
+          let nextQ = if firstInd + window == ind + 1 then shiftedQ else newQ
+          in (firstVal, ind + 1, nextQ)
 
-slidingMean :: Int -> Signal -> Signal
-slidingMean r arr = arrayFromList meanList 
-   where
-     meanList =
-       [ meanAt i r arr
-       | i <- A.range (0, (snd (A.bounds arr) + 1) - r)
-       ]
-
-slidingVariance :: Int -> Signal -> Signal
-slidingVariance r arr = arrayFromList varianceList
+streamingMax :: Int -> Signal -> Signal
+streamingMax window es = stream es
   where
-    varianceList =
-      [ sum [ ((arr ! j) - (meanAt i r arr)) ** 2
-            | j <- A.range (i, i + r - 1)
-            ] / (fromIntegral r)
-      | i <- A.range (0, (snd (A.bounds arr) + 1) - r)
-      ]
-
-slidingMin  :: Int -> Signal -> Signal
-slidingMin r arr = arrayFromList minList
-  where
-    minList =
-      [ minimum
-          [ arr ! j
-          | j <- A.range (i, i + r - 1)
-          ]
-      | i <- A.range (0, (snd (A.bounds arr) + 1) - r)
-      ]
-
-slidingMax  :: Int -> Signal -> Signal
-slidingMax r arr = arrayFromList minList
-  where
-    minList =
-      [ maximum
-          [ arr ! j
-          | j <- A.range (i, i + r - 1)
-          ]
-      | i <- A.range (0, (snd (A.bounds arr) + 1) - r)
-      ]
+    stream = (drop window) . (map gfst) . (scanl iter (0, 0, empty))
+    iter :: (Double, Int, BankersDequeue (Int, Double)) -> Double -> (Double, Int, BankersDequeue (Int, Double))
+    iter (_, !ind, !q) !e =
+      let newQ = e `seq` pushBack (clearLastElementsFromQueue (<) q e) (ind, e)
+      in case popFront newQ of
+        Nothing                                -> (0, ind + 1, newQ)
+        Just (!(!firstInd, !firstVal), shiftedQ)  ->
+          let nextQ = if firstInd + window == ind + 1 then shiftedQ else newQ
+          in (firstVal, ind + 1, nextQ)
 
 slidingUntil :: Int -> Signal -> Signal -> Signal
-slidingUntil r arr1 arr2 = arrayFromList untilList
+slidingUntil n as bs = stream
   where
-    untilList =
-      [ maximum
-          [ min
-              (arr2 ! k)
-              (minimum
-                [ arr1 ! j
-                | j <- A.range (i, k - 1)
-                ]
-              )
-          | k <- A.range (i, i + r - 1)
-          ]
-      | i <- A.range (0, (snd (A.bounds arr2) + 1) - r)
-      ]
+    stream =
+      fmap
+        maximum
+        (zipWith
+           (zipWith min)
+           (ev bs)
+           (gl as)
+        )
+    ev :: [Double] -> [[Double]]
+    ev = takeWhile ((==n) . length) . fmap (take n) . tails
+    gl :: [Double] -> [[Double]]
+    gl = fmap (scanl min 99999999) . ev
 
-type Trace = [Signal]
+streamingMean :: Int -> Signal -> Signal
+streamingMean window es = stream es
+  where
+    w = fromIntegral window
+    stream = (drop window) . (map gfst) . (scanl iter (0, 0, empty))
+    iterVal :: Double -> Double -> Double -> Double
+    iterVal lastMean newItem firstItem = (lastMean * w + newItem - firstItem) / w
+    iter :: (Double, Int, BankersDequeue (Int, Double)) -> Double -> (Double, Int, BankersDequeue (Int, Double))
+    iter (lastVal, ind, q) newItem =
+      case popFront q of
+        Nothing                                ->
+          -- just starting, the queue has no items yet.
+          ( iterVal lastVal newItem 0
+          , ind + 1
+          , pushBack q (ind, newItem)
+          )
+        Just ((firstInd, firstItem), shiftedQ)  ->
+          if firstInd + window == ind + 1
+          -- reached window size, so we pop from front of queue
+          then ( iterVal lastVal newItem firstItem
+               , ind + 1
+               , pushBack shiftedQ (ind, newItem)
+               )
+          -- not reached window size, so we dont pop
+          else ( iterVal lastVal newItem 0
+               , ind + 1
+               , pushBack q (ind, newItem)
+               )
 
-evalArithmetic :: Trace -> Int -> Arithmetic -> Signal
-evalArithmetic trace evalIndex formula =
+streamingVariance :: Int -> Signal -> Signal
+streamingVariance window es = stream es
+  where
+    w = fromIntegral window
+    stream = (drop window) . (map (gfst . gfst)) . (scanl iter ((0, 0, 0), 0, empty))
+    iterVal :: (Double, Double, Double) -> Double -> Double -> (Double, Double, Double)
+    iterVal (_lastVariance, sumOfSquares, sums) newItem firstItem =
+      let sumOfSquares' = sumOfSquares + (newItem * newItem) - (firstItem * firstItem)
+          sums' = sums + newItem - firstItem
+      in ( (sumOfSquares' * w - (sums' * sums')) / (w * (w - 1))
+         , sumOfSquares'
+         , sums'
+         )
+
+    iter :: ((Double, Double, Double), Int, BankersDequeue (Int, Double)) -> Double -> ((Double, Double, Double), Int, BankersDequeue (Int, Double))
+    iter (lastVal, ind, q) newItem =
+      case popFront q of
+        Nothing                                ->
+          -- just starting, the queue has no items yet.
+          ( iterVal lastVal newItem 0
+          , ind + 1
+          , pushBack q (ind, newItem)
+          )
+        Just ((firstInd, firstItem), shiftedQ)  ->
+          if firstInd + window == ind + 1
+          -- reached window size, so we pop from front of queue
+          then ( iterVal lastVal newItem firstItem
+               , ind + 1
+               , pushBack shiftedQ (ind, newItem)
+               )
+          -- not reached window size, so we dont pop
+          else ( iterVal lastVal newItem 0
+               , ind + 1
+               , pushBack q (ind, newItem)
+               )
+
+type Trace = [[Double]]
+
+evalArithmetic :: Trace -> Arithmetic -> Signal
+evalArithmetic trace formula =
   case formula of
     SignalReference ref  -> trace !! ref
-    Addition f1 f2       -> zipArraysWith (+) (evalArithmetic trace evalIndex f1) (evalArithmetic trace evalIndex f2)
-    Subtraction f1 f2    -> zipArraysWith (-) (evalArithmetic trace evalIndex f1) (evalArithmetic trace evalIndex f2)
-    Multiplication f1 f2 -> zipArraysWith (*) (evalArithmetic trace evalIndex f1) (evalArithmetic trace evalIndex f2)
-    Mean r f             -> slidingMean r (evalArithmetic trace evalIndex f)
-    Variance r f         -> slidingVariance r (evalArithmetic trace evalIndex f)
+    Addition f1 f2       -> zipWith (+) (evalArithmetic trace f1) (evalArithmetic trace f2)
+    Subtraction f1 f2    -> zipWith (-) (evalArithmetic trace f1) (evalArithmetic trace f2)
+    Multiplication f1 f2 -> zipWith (*) (evalArithmetic trace f1) (evalArithmetic trace f2)
+    Mean r f             -> streamingMean r (evalArithmetic trace f)
+    Variance r f         -> streamingVariance r (evalArithmetic trace f)
 
-evalFormula :: Trace -> Int -> Formula -> Signal
-evalFormula trace i formula =
+evalFormula :: Trace -> Formula -> Signal
+evalFormula trace formula =
   case formula of
-    LessThan v f      -> A.amap (\e -> fromIntegral v - e) (evalArithmetic trace i f)
-    GreaterThan v f   -> A.amap (\e -> e - fromIntegral v) (evalArithmetic trace i f)
-    Conjunction f1 f2 -> zipArraysWith (max)  (evalFormula trace i f1) (evalFormula trace i f2)
-    Disjunction f1 f2 -> zipArraysWith (min)  (evalFormula trace i f1) (evalFormula trace i f2)
-    Negation f        -> A.amap (\e -> 0 - e) (evalFormula trace i f)
-    Until r f1 f2     -> slidingUntil r (evalFormula trace i f1) (evalFormula trace i f2)
-    Eventually r f    -> slidingMax r (evalFormula trace i f)
-    Globally r f      -> slidingMin r (evalFormula trace i f)
+    LessThan v f      -> fmap (\e -> fromIntegral v - e) (evalArithmetic trace f)
+    GreaterThan v f   -> fmap (\e -> e - fromIntegral v) (evalArithmetic trace f)
+    Conjunction f1 f2 -> zipWith min (evalFormula trace f1) (evalFormula trace f2)
+    Disjunction f1 f2 -> zipWith max (evalFormula trace f1) (evalFormula trace f2)
+    Negation f        -> fmap (\e -> 0 - e) (evalFormula trace f)
+    Until r f1 f2     -> slidingUntil (r + 1) (evalFormula trace f1) (evalFormula trace f2)
+    Eventually r f    -> streamingMax (r + 1) (evalFormula trace f)
+    Globally r f      -> streamingMin (r + 1) (evalFormula trace f)
 
-
-readSamplesFromCommaSeparatedByteString :: ByteString -> [[Double]]
-readSamplesFromCommaSeparatedByteString = transpose . fmap readSamplesOnLine . C.lines
+readSamples :: String -> [[Double]]
+readSamples = transpose . fmap readSamplesOnLine . lines
   where
-    readSamplesOnLine = fmap (fromIntegral . fst) . catMaybes . fmap C.readInt . (C.split ',')
+    readSamplesOnLine = catMaybes . fmap readMaybe . words
 
-main = do
-  [formulaFile, traceFile, resultFile] <- Env.getArgs
+entry formulaFile traceFile resultFile = do
   putStrLn ("Formula file: " ++ formulaFile)
   putStrLn ("Trace file: " ++ traceFile)
   putStrLn ("Result file: " ++ resultFile)
 
   contentsOfFormulaFile <- BS.readFile formulaFile
-  -- C.putStrLn contentsOfFormulaFile
 
   let Just (formula, rest) = runStateT parseFormula contentsOfFormulaFile
   putStrLn (show formula)
 
-  contentsOfTraceFile <- BS.readFile traceFile
-  let samplesOfTraceFile = readSamplesFromCommaSeparatedByteString contentsOfTraceFile
-      traceLength = (length . head) samplesOfTraceFile
-      trace :: Trace
-      trace = fmap (A.listArray (0, traceLength - 1)) samplesOfTraceFile
-  putStrLn (show (samplesOfTraceFile))
-  putStrLn (show trace)
-  putStrLn ((show . A.elems) (evalFormula trace 0 formula))
+  contentsOfTraceFile <- readFile traceFile
+  let trace = readSamples contentsOfTraceFile
+  
+  let result = (evalFormula trace formula)
+  withFile resultFile WriteMode (\h -> traverse_ (hPrintf h "%.11f\n") result)
+
+
+main = do
+  [formulaFile, traceFile, resultFile] <- Env.getArgs
+  entry formulaFile traceFile resultFile

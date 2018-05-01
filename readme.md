@@ -10,6 +10,7 @@ To run against space separated values of multiple traces to be read from `trace_
 
 See `test_data` folder for small example data with expected results.
 
+Tested with ghc 7.10, `make` should output the executable.
 
 ### Example Formulas, in prefix form
 
@@ -35,3 +36,11 @@ Which checks the (> 0 x0) at every point of the trace and if it is not then we n
 
 Trace x1 should satisfy (< 10) until x0 satisfies (> 0). With a window of one, we look at two samples
 from every point of the signal.
+
+### Implementation
+
+Uses despised Lazy IO to get constant memory determined only by the window
+size of the operations in the formula.
+Until operation is quadratic in window size, while the rest is linear.
+
+Banker's Dequeues are copied from [dequeue package](http://hackage.haskell.org/package/dequeue-0.1.12/docs/src/Data-Dequeue.html#BankersDequeue), as the required evaluation environment in the labs did not provide package managers.

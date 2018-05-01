@@ -1,0 +1,15 @@
+Formula list:
+
+> 5 x0
+F 3 > 0 x0
+G 2 > 10 + x0 x1
+U 0 > 0 x0 < 10 x1
+U 1 > 0 x0 < 10 x1
+
+
+There are 4 signal files in this folder: s0, s1, s2, s3
+
+
+
+fi_qv_j:  quantitative valuation result of formula i on signal file j.
+e.g. f2_qv_0, quantitative valuation result of "G 2 > 10 + x0 x1" on s0.
